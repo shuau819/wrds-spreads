@@ -128,8 +128,7 @@ fetch_complete_nbbo <- function(con, ticker, date, start_sec, end_sec) {
       "    AND time_m > TIME %s AND time_m < TIME %s",
       ")",
       "SELECT * FROM prior UNION ALL SELECT * FROM inside_window ORDER BY time_sec",
-      sep = "
-"
+      sep = "\n"
     ),
     schema, table, DBI::dbQuoteString(con, ticker), DBI::dbQuoteString(con, start_clock),
     schema, table, DBI::dbQuoteString(con, ticker),
