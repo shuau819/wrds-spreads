@@ -1,0 +1,10 @@
+# Generated results and local R files
+run_output/
+.Rhistory
+.RData
+.Rproj.user/
+
+# Local credentials and environment files
+.Renviron
+*.key
+*.pem
