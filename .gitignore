@@ -1,5 +1,6 @@
 # Generated results and local R files
 run_output/
+.DS_Store
 .Rhistory
 .RData
 .Rproj.user/
