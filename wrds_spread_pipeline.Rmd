@@ -1,0 +1,723 @@
+---
+title: "WRDS Complete-NBBO Spread"
+date: "10/16/2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Purpose
+
+This notebook calculates time-weighted relative quoted spreads from WRDS Daily
+TAQ `complete_nbbo` tables. Each input row identifies one ETF, one trading date,
+and one event-time anchor. The output contains one observation for each requested
+event-time window.
+
+The relative quoted spread is measured in basis points:
+
+\[
+10{,}000 \times \frac{Ask-Bid}{(Ask+Bid)/2}.
+\]
+
+Locked quotes (`bid = ask`) are retained and contribute a zero spread. Crossed
+quotes (`bid > ask`) are excluded only for the time for which they are active.
+The previous quote is not carried forward across a crossed interval.
+
+# 1. Package setup
+
+Install the required packages once.
+```{r install-packages, eval=FALSE}
+install.packages(c("data.table", "DBI", "RPostgres"))
+```
+
+Load `data.table`
+```{r setup, message=FALSE, warning=FALSE}
+library(data.table)
+```
+
+# 2. Define the event-time windows
+
+The analysis uses six non-overlapping windows relative to `anchor_time`. The
+left endpoint is included and the right endpoint is excluded.
+
+```{r define-windows}
+WINDOWS <- data.table(
+  window = c("m30_m10", "m10_0", "0_5", "5_10", "10_15", "15_20"),
+  start_min = c(-30, -10, 0, 5, 10, 15),
+  end_min = c(-10, 0, 5, 10, 15, 20)
+)
+
+WINDOWS
+```
+
+# 3. Time conversion functions
+
+WRDS stores quote times as clock times, while the weighting calculation is
+easier in seconds after midnight. These functions convert between the two
+representations and reject invalid times.
+
+```{r time-functions}
+clock_to_seconds <- function(x) {
+  parts <- strsplit(as.character(x), ":", fixed = TRUE)[[1L]]
+  if (length(parts) != 3L) stop("anchor_time must be HH:MM:SS")
+
+  values <- suppressWarnings(as.numeric(parts))
+  if (anyNA(values) ||
+      values[1L] < 0 || values[1L] >= 24 ||
+      values[2L] < 0 || values[2L] >= 60 ||
+      values[3L] < 0 || values[3L] >= 60) {
+    stop("Invalid anchor_time: ", x)
+  }
+
+  values[1L] * 3600 + values[2L] * 60 + values[3L]
+}
+
+seconds_to_clock <- function(x) {
+  if (x < 0 || x >= 86400) stop("Requested windows cross midnight")
+
+  h <- floor(x / 3600)
+  m <- floor((x %% 3600) / 60)
+  s <- x %% 60
+
+  sprintf("%02d:%02d:%09.6f", h, m, s)
+}
+```
+
+# 4. Read and validate the input file
+
+The input CSV must contain `ticker`, `date`, `anchor_time`, `day_type`, and
+`matched_event_date`. Validation is performed before any WRDS query begins.
+
+```{r validate-input-function}
+validate_input <- function(x) {
+  required <- c(
+    "ticker", "date", "anchor_time", "day_type", "matched_event_date"
+  )
+
+  missing_cols <- setdiff(required, names(x))
+  if (length(missing_cols)) {
+    stop("Input is missing columns: ", paste(missing_cols, collapse = ", "))
+  }
+
+  x[, input_row := .I]
+  x[, ticker := toupper(trimws(as.character(ticker)))]
+  x[, date := as.IDate(date)]
+  x[, matched_event_date := as.IDate(matched_event_date)]
+  x[, anchor_time := trimws(as.character(anchor_time))]
+  x[, day_type := tolower(trimws(as.character(day_type)))]
+
+  if (anyNA(x$date)) {
+    stop("At least one date is invalid; use YYYY-MM-DD")
+  }
+  if (anyNA(x$matched_event_date)) {
+    stop("At least one matched_event_date is invalid")
+  }
+  if (any(!x$day_type %chin% c("event", "comparison"))) {
+    stop("day_type must be event or comparison")
+  }
+  if (any(!grepl("^[A-Z0-9-]{1,15}$", x$ticker))) {
+    stop("ticker must be a root ticker without a suffix")
+  }
+
+  x
+}
+```
+
+The example below loads the provided XLK test row. Replace the path with the
+full research input file when it is ready.
+
+```{r read-input}
+input_file <- file.choose()
+input <- validate_input(fread(input_file, colClasses = "character"))
+input
+```
+
+# 5. Store WRDS credentials locally
+
+Credentials should never be typed into this notebook or committed to GitHub.
+Run the following commands once in the R console after replacing the
+placeholders. Then restart R. The `.Renviron` file is excluded by `.gitignore`.
+
+```{r credential-instructions, eval=FALSE}
+usethis::edit_r_environ()
+
+# Add these two lines to ~/.Renviron, using your own credentials:
+# WRDS_USER=your_wrds_username
+# WRDS_PASSWORD=your_wrds_password
+```
+
+# 6. Connect to WRDS
+
+This function reads the credentials from environment variables and opens an
+encrypted PostgreSQL connection to WRDS. It stops with a clear message if the
+credentials or packages are missing.
+
+```{r connect-function}
+connect_wrds <- function() {
+  if (!requireNamespace("DBI", quietly = TRUE) ||
+      !requireNamespace("RPostgres", quietly = TRUE)) {
+    stop("Install DBI and RPostgres before connecting to WRDS")
+  }
+
+  user <- Sys.getenv("WRDS_USER")
+  password <- Sys.getenv("WRDS_PASSWORD")
+
+  if (!nzchar(user) || !nzchar(password)) {
+    stop("Set WRDS_USER and WRDS_PASSWORD in ~/.Renviron, then restart R")
+  }
+
+  DBI::dbConnect(
+    RPostgres::Postgres(),
+    host = "wrds-pgdata.wharton.upenn.edu",
+    port = 9737,
+    dbname = "wrds",
+    sslmode = "require",
+    user = user,
+    password = password
+  )
+}
+```
+
+Open the connection only when a live WRDS query is required. This chunk is
+disabled during knitting so that the report can be rendered offline.
+
+```{r open-connection, eval=FALSE}
+con <- connect_wrds()
+```
+
+# 7. Pull complete-NBBO quotes
+
+For a given ticker and date, this function queries the corresponding daily
+table, such as `taqm_2019.complete_nbbo_20190130`.
+
+The query retrieves both:
+
+1. The last quote at or before the first window boundary, so a quote already
+   active at the boundary is included.
+2. Every quote update inside the requested period.
+
+```{r fetch-quotes-function}
+fetch_complete_nbbo <- function(con, ticker, date, start_sec, end_sec) {
+  year <- format(as.IDate(date), "%Y")
+  ymd <- format(as.IDate(date), "%Y%m%d")
+  schema <- paste0("taqm_", year)
+  table <- paste0("complete_nbbo_", ymd)
+
+  start_clock <- seconds_to_clock(start_sec)
+  end_clock <- seconds_to_clock(end_sec)
+
+  sql <- sprintf(
+    paste(
+      "WITH prior AS (",
+      "  SELECT date, time_m,",
+      "         EXTRACT(EPOCH FROM time_m)::double precision AS time_sec,",
+      "         sym_root,",
+      "         best_bid::double precision AS best_bid,",
+      "         best_ask::double precision AS best_ask",
+      "  FROM %s.%s",
+      "  WHERE sym_root = %s",
+      "    AND COALESCE(sym_suffix, '') = ''",
+      "    AND time_m <= TIME %s",
+      "  ORDER BY time_m DESC",
+      "  LIMIT 1",
+      "), inside_window AS (",
+      "  SELECT date, time_m,",
+      "         EXTRACT(EPOCH FROM time_m)::double precision AS time_sec,",
+      "         sym_root,",
+      "         best_bid::double precision AS best_bid,",
+      "         best_ask::double precision AS best_ask",
+      "  FROM %s.%s",
+      "  WHERE sym_root = %s",
+      "    AND COALESCE(sym_suffix, '') = ''",
+      "    AND time_m > TIME %s",
+      "    AND time_m < TIME %s",
+      ")",
+      "SELECT * FROM prior",
+      "UNION ALL",
+      "SELECT * FROM inside_window",
+      "ORDER BY time_sec",
+      sep = "\n"
+    ),
+    schema,
+    table,
+    DBI::dbQuoteString(con, ticker),
+    DBI::dbQuoteString(con, start_clock),
+    schema,
+    table,
+    DBI::dbQuoteString(con, ticker),
+    DBI::dbQuoteString(con, start_clock),
+    DBI::dbQuoteString(con, end_clock)
+  )
+
+  as.data.table(DBI::dbGetQuery(con, sql))
+}
+```
+
+# 8. Classify each quote state
+
+Each two-sided quote is assigned to one diagnostic category. Valid and locked
+quotes are used in the spread calculation. Crossed, missing, and non-positive
+quotes are excluded and their durations are reported.
+
+```{r classify-function}
+classify_state <- function(bid, ask) {
+  fcase(
+    is.na(bid) | is.na(ask),
+    "missing_price",
+
+    !is.finite(bid) | !is.finite(ask) | bid <= 0 | ask <= 0,
+    "invalid_price",
+
+    bid > ask,
+    "crossed",
+
+    bid == ask,
+    "locked",
+
+    bid < ask,
+    "valid",
+
+    default = "invalid_price"
+  )
+}
+```
+
+# 9. Convert quotes into active states
+
+Each quote is active from its timestamp until the next quote update. The final
+quote already active at 30 minutes before the anchor is carried into the first
+minute. If several records share a timestamp, the last returned state becomes
+active. Crossed quotes are never replaced with the previous valid quote.
+
+```{r prepare-states-function}
+prepare_quote_states <- function(quotes, anchor_sec) {
+  global_start <- anchor_sec - 30 * 60
+  global_end <- anchor_sec + 20 * 60
+
+  quotes <- copy(as.data.table(quotes))
+  quotes <- quotes[is.finite(time_sec) & time_sec < global_end]
+  setorder(quotes, time_sec)
+
+  if (nrow(quotes)) {
+    quotes <- quotes[, .SD[.N], by = time_sec]
+  }
+
+  if (!nrow(quotes)) {
+    return(data.table(
+      state_start = global_start,
+      state_end = global_end,
+      state = "missing_quote",
+      spread_bps = NA_real_
+    ))
+  }
+
+  quotes[, state_start := pmax(time_sec, global_start)]
+  quotes[, state_end := shift(time_sec, type = "lead", fill = global_end)]
+  quotes[, state_end := pmin(state_end, global_end)]
+  quotes <- quotes[state_end > state_start]
+  quotes[, state := classify_state(best_bid, best_ask)]
+  quotes[, spread_bps := fifelse(
+    state %chin% c("valid", "locked"),
+    10000 * (best_ask - best_bid) / ((best_ask + best_bid) / 2),
+    NA_real_
+  )]
+
+  states <- quotes[, .(state_start, state_end, state, spread_bps)]
+
+  if (!nrow(states) || states$state_start[1L] > global_start) {
+    first_start <- if (nrow(states)) states$state_start[1L] else global_end
+    states <- rbind(
+      data.table(
+        state_start = global_start,
+        state_end = first_start,
+        state = "missing_quote",
+        spread_bps = NA_real_
+      ),
+      states
+    )
+  }
+
+  states
+}
+```
+
+# 10. Calculate 50 one-minute spreads
+
+The graph dataset contains one time-weighted observation for every minute from
+`-30` through `+19`, giving 50 minutes per ETF-date. Two versions are produced:
+
+- `keep_locked`: locked quotes are valid and contribute a zero spread;
+- `exclude_locked`: locked duration is removed from the robustness calculation.
+
+`complete_quote_coverage` checks whether the full minute has a valid or locked
+two-sided quote. `complete_calculation_coverage` additionally requires every
+second to be eligible for the selected locked-quote treatment.
+
+```{r calculate-minute-spreads-function}
+calculate_one_minute_spreads <- function(
+    states,
+    anchor_sec,
+    include_locked = TRUE) {
+
+  minute_starts <- -30:19
+  locked_treatment <- if (include_locked) "keep_locked" else "exclude_locked"
+  eligible_states <- if (include_locked) c("valid", "locked") else "valid"
+
+  rbindlist(lapply(minute_starts, function(minute_start_min) {
+    minute_start <- anchor_sec + minute_start_min * 60
+    minute_end <- minute_start + 60
+
+    overlap <- states[
+      state_end > minute_start & state_start < minute_end,
+      .(
+        state,
+        spread_bps,
+        seconds = pmax(
+          0,
+          pmin(state_end, minute_end) - pmax(state_start, minute_start)
+        )
+      )
+    ][seconds > 0]
+
+    duration_for <- function(label) sum(overlap[state == label, seconds])
+    valid_seconds <- duration_for("valid")
+    locked_seconds <- duration_for("locked")
+    eligible_seconds <- sum(overlap[state %chin% eligible_states, seconds])
+
+    numerator <- sum(
+      overlap[state %chin% eligible_states, spread_bps * seconds],
+      na.rm = TRUE
+    )
+
+    quote_coverage_seconds <- valid_seconds + locked_seconds
+
+    data.table(
+      locked_treatment = locked_treatment,
+      minute_start_min = minute_start_min,
+      minute_end_min = minute_start_min + 1L,
+      tw_relative_quoted_spread_bps = if (eligible_seconds > 0) {
+        numerator / eligible_seconds
+      } else {
+        NA_real_
+      },
+      valid_seconds = valid_seconds,
+      locked_seconds = locked_seconds,
+      crossed_seconds = duration_for("crossed"),
+      missing_quote_seconds = duration_for("missing_quote"),
+      missing_price_seconds = duration_for("missing_price"),
+      invalid_price_seconds = duration_for("invalid_price"),
+      eligible_seconds = eligible_seconds,
+      excluded_seconds = 60 - eligible_seconds,
+      quote_coverage_pct = 100 * quote_coverage_seconds / 60,
+      calculation_coverage_pct = 100 * eligible_seconds / 60,
+      complete_quote_coverage = abs(quote_coverage_seconds - 60) < 1e-7,
+      complete_calculation_coverage = abs(eligible_seconds - 60) < 1e-7
+    )
+  }))
+}
+```
+
+# 11. Construct regression windows from minute averages
+
+The four post-announcement regression measures are simple averages of five
+one-minute spreads. The baseline is the average of the 20 one-minute spreads
+from `-30` to `-10`. The `-10` to `0` window is retained as an anticipation
+diagnostic.
+
+The unfiltered mean is preserved for review. `regression_spread_bps` is set to
+missing unless every underlying minute has complete two-sided quote coverage
+and a calculable spread under the selected locked-quote treatment. A short
+locked interval therefore does not make the robustness window incomplete, but
+a minute containing only locked quotes has no excluding-locked spread.
+
+```{r aggregate-minute-windows-function}
+aggregate_minute_windows <- function(minute_results) {
+  rbindlist(lapply(seq_len(nrow(WINDOWS)), function(i) {
+    w <- WINDOWS[i]
+    x <- minute_results[
+      minute_start_min >= w$start_min & minute_start_min < w$end_min
+    ]
+
+    expected_minutes <- w$end_min - w$start_min
+    complete_window <- nrow(x) == expected_minutes &&
+      all(x$complete_quote_coverage) &&
+      all(!is.na(x$tw_relative_quoted_spread_bps))
+
+    raw_mean <- if (any(!is.na(x$tw_relative_quoted_spread_bps))) {
+      mean(x$tw_relative_quoted_spread_bps, na.rm = TRUE)
+    } else {
+      NA_real_
+    }
+
+    data.table(
+      locked_treatment = unique(x$locked_treatment),
+      window = w$window,
+      window_start_min = w$start_min,
+      window_end_min = w$end_min,
+      expected_minutes = expected_minutes,
+      observed_minutes = nrow(x),
+      complete_quote_minutes = sum(x$complete_quote_coverage),
+      complete_calculation_minutes = sum(x$complete_calculation_coverage),
+      all_minutes_complete = complete_window,
+      mean_of_minute_spreads_bps = raw_mean,
+      regression_spread_bps = if (complete_window) raw_mean else NA_real_,
+      valid_seconds = sum(x$valid_seconds),
+      locked_seconds = sum(x$locked_seconds),
+      crossed_seconds = sum(x$crossed_seconds),
+      missing_quote_seconds = sum(x$missing_quote_seconds),
+      missing_price_seconds = sum(x$missing_price_seconds),
+      invalid_price_seconds = sum(x$invalid_price_seconds),
+      eligible_seconds = sum(x$eligible_seconds),
+      excluded_seconds = sum(x$excluded_seconds)
+    )
+  }))
+}
+```
+
+# 12. Process one ETF-date observation
+
+This wrapper downloads one ETF-date and returns both the 50-minute graph data
+and the six summary windows for the main and robustness treatments.
+
+```{r process-one-function}
+process_one <- function(con, row) {
+  metadata <- row[, .(
+    input_row, ticker, date, anchor_time, day_type, matched_event_date
+  )]
+
+  tryCatch({
+    anchor_sec <- clock_to_seconds(row$anchor_time)
+    global_start <- anchor_sec - 30 * 60
+    global_end <- anchor_sec + 20 * 60
+    seconds_to_clock(global_start)
+    seconds_to_clock(global_end)
+
+    quotes <- fetch_complete_nbbo(
+      con, row$ticker, row$date, global_start, global_end
+    )
+    states <- prepare_quote_states(quotes, anchor_sec)
+
+    minute_results <- rbindlist(list(
+      calculate_one_minute_spreads(states, anchor_sec, include_locked = TRUE),
+      calculate_one_minute_spreads(states, anchor_sec, include_locked = FALSE)
+    ))
+    window_results <- rbindlist(
+      lapply(
+        split(minute_results, by = "locked_treatment", keep.by = TRUE),
+        aggregate_minute_windows
+      )
+    )
+
+    minute_results[, processing_error := ""]
+    window_results[, processing_error := ""]
+
+    list(
+      minutes = cbind(metadata[rep(1L, nrow(minute_results))], minute_results),
+      windows = cbind(metadata[rep(1L, nrow(window_results))], window_results)
+    )
+  }, error = function(e) {
+    message <- conditionMessage(e)
+    minute_error <- CJ(
+      locked_treatment = c("keep_locked", "exclude_locked"),
+      minute_start_min = -30:19
+    )
+    minute_error[, `:=`(
+      minute_end_min = minute_start_min + 1L,
+      tw_relative_quoted_spread_bps = NA_real_,
+      processing_error = message
+    )]
+
+    window_error <- CJ(
+      locked_treatment = c("keep_locked", "exclude_locked"),
+      window = WINDOWS$window
+    )
+    window_error <- merge(window_error, WINDOWS, by = "window", sort = FALSE)
+    setnames(
+      window_error,
+      c("start_min", "end_min"),
+      c("window_start_min", "window_end_min")
+    )
+    window_error[, `:=`(
+      mean_of_minute_spreads_bps = NA_real_,
+      regression_spread_bps = NA_real_,
+      all_minutes_complete = FALSE,
+      processing_error = message
+    )]
+
+    list(
+      minutes = cbind(metadata[rep(1L, nrow(minute_error))], minute_error),
+      windows = cbind(metadata[rep(1L, nrow(window_error))], window_error)
+    )
+  })
+}
+```
+
+# 13. Run an offline logic test
+
+The test verifies the carry-in quote, 50-minute output, crossed-quote exclusion,
+locked-quote inclusion in the main version, and locked-quote exclusion in the
+robustness version.
+
+```{r self-test}
+anchor_test <- 14 * 3600
+synthetic_quotes <- data.table(
+  time_sec = c(
+    13 * 3600 + 20 * 60,
+    13 * 3600 + 40 * 60,
+    13 * 3600 + 55 * 60,
+    14 * 3600,
+    14 * 3600 + 5 * 60
+  ),
+  best_bid = c(99, 100, 102, 101, 102),
+  best_ask = c(101, 102, 101, 101, 103)
+)
+
+test_states <- prepare_quote_states(synthetic_quotes, anchor_test)
+test_keep <- calculate_one_minute_spreads(
+  test_states, anchor_test, include_locked = TRUE
+)
+test_exclude <- calculate_one_minute_spreads(
+  test_states, anchor_test, include_locked = FALSE
+)
+test_windows <- aggregate_minute_windows(test_keep)
+
+stopifnot(
+  nrow(test_keep) == 50,
+  nrow(test_exclude) == 50,
+  test_keep[minute_start_min == -30, valid_seconds] == 60,
+  sum(test_keep[minute_start_min %between% c(-5, -1), crossed_seconds]) == 300,
+  test_keep[minute_start_min == 0, locked_seconds] == 60,
+  test_keep[minute_start_min == 0, tw_relative_quoted_spread_bps] == 0,
+  is.na(test_exclude[
+    minute_start_min == 0, tw_relative_quoted_spread_bps
+  ]),
+  test_windows[window == "0_5", regression_spread_bps] == 0
+)
+
+test_windows
+```
+
+# 14. Run the XLK live test
+
+This disabled chunk produces 100 minute rows (50 minutes times two locked-quote
+treatments) and 12 window rows (six windows times two treatments).
+
+```{r xlk-live-test, eval=FALSE}
+con <- connect_wrds()
+xlk_input <- input[
+  ticker == "XLK" &
+  date == as.IDate("2019-01-30") &
+  anchor_time == "14:00:00"
+]
+stopifnot(nrow(xlk_input) == 1L)
+
+xlk_result <- process_one(con, xlk_input[1])
+xlk_result$minutes
+xlk_result$windows
+
+DBI::dbDisconnect(con)
+```
+
+# 15. Run the full batch
+
+Every input row is processed independently. A failed ticker-date is recorded
+and later rows continue.
+
+```{r full-batch, eval=FALSE}
+input_file <- file.choose()
+input <- validate_input(fread(input_file, colClasses = "character"))
+
+con <- connect_wrds()
+
+result_list <- lapply(seq_len(nrow(input)), function(i) {
+  message("Processing row ", i, "/", nrow(input),
+          ": ", input$ticker[i], " ", input$date[i])
+  process_one(con, input[i])
+})
+
+minute_results <- rbindlist(
+  lapply(result_list, `[[`, "minutes"), fill = TRUE
+)
+window_results <- rbindlist(
+  lapply(result_list, `[[`, "windows"), fill = TRUE
+)
+
+DBI::dbDisconnect(con)
+
+View(window_results)
+```
+
+# 16. Write output files
+
+`minute_spreads.csv` supplies the 50-minute graph data. `spreads.csv` supplies
+the baseline, anticipation, and four post-announcement windows. The diagnostics
+file combines coverage and error fields at both resolutions.
+
+```{r write-outputs, eval=FALSE}
+output_dir <- "run_output/full_batch"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+minute_spread_columns <- c(
+  "input_row", "ticker", "date", "anchor_time", "day_type",
+  "matched_event_date", "locked_treatment", "minute_start_min",
+  "minute_end_min", "tw_relative_quoted_spread_bps"
+)
+window_spread_columns <- c(
+  "input_row", "ticker", "date", "anchor_time", "day_type",
+  "matched_event_date", "locked_treatment", "window",
+  "window_start_min", "window_end_min", "mean_of_minute_spreads_bps",
+  "regression_spread_bps", "all_minutes_complete"
+)
+
+fwrite(
+  minute_results[, ..minute_spread_columns],
+  file.path(output_dir, "minute_spreads.csv"),
+  na = ""
+)
+fwrite(
+  window_results[, ..window_spread_columns],
+  file.path(output_dir, "spreads.csv"),
+  na = ""
+)
+
+minute_diagnostics <- copy(minute_results)
+minute_diagnostics[, `:=`(
+  output_level = "minute",
+  period = paste0(minute_start_min, "_", minute_end_min)
+)]
+window_diagnostics <- copy(window_results)
+window_diagnostics[, `:=`(
+  output_level = "window",
+  period = window
+)]
+
+fwrite(
+  rbindlist(
+    list(minute_diagnostics, window_diagnostics),
+    fill = TRUE,
+    use.names = TRUE
+  ),
+  file.path(output_dir, "diagnostics.csv"),
+  na = ""
+)
+```
+
+# 17. Interpret the diagnostics
+
+- `locked_treatment` identifies the main (`keep_locked`) or robustness
+  (`exclude_locked`) result.
+- `complete_quote_coverage` requires a valid or locked two-sided quote for the
+  entire minute.
+- `complete_calculation_coverage` shows the percentage of the minute used in
+  the selected calculation. For `exclude_locked`, it may be below 100% even
+  when two-sided quote coverage is complete.
+- `regression_spread_bps` is populated only when every required minute is
+  complete. `mean_of_minute_spreads_bps` is retained for diagnostic review.
+- `crossed_seconds` is excluded without carrying the earlier quote forward.
+- `processing_error` records a failed ticker-date without stopping the batch.
+
+The 50 one-minute observations are used for descriptive graphs. The four
+post-announcement five-minute observations and the 20-minute baseline are used
+to construct the regression variables.
