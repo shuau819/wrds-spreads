@@ -33,9 +33,6 @@ in the diagnostics.
 ## Repository files
 
 - `wrds_spread_pipeline.Rmd`: current documented analysis workflow.
-- `input_example.csv`: one-row XLK test input for January 30, 2019 at 14:00 ET.
-- `run_wrds_spreads.R`: earlier command-line version retained for reference.
-- `run_output/`: locally generated output folder; it is not uploaded to GitHub.
 
 ## 1. Download the repository
 
@@ -60,9 +57,7 @@ R 4.2 or later is recommended. The WRDS account must have access to NYSE Daily
 TAQ.
 
 ## 3. Store WRDS credentials locally
-
-Never type a username or password into the RMD, a CSV, or a GitHub file. In the
-R console, run:
+run:
 
 ```r
 usethis::edit_r_environ()
@@ -74,8 +69,7 @@ Add these lines using your own credentials:
 WRDS_USER=your_wrds_username
 WRDS_PASSWORD=your_wrds_password
 ```
-
-Save the file and restart RStudio. `.Renviron` is excluded by `.gitignore`.
+Save the file and restart RStudio. 
 
 ## 4. Prepare the input CSV
 
