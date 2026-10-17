@@ -1,44 +1,85 @@
 # WRDS complete-NBBO spread pipeline
 
-This pipeline reads one ETF-date-anchor observation per input row, queries the corresponding WRDS Daily TAQ `complete_nbbo_YYYYMMDD` table, and writes time-weighted relative quoted spreads for six event-time windows.
+This repository contains an R Markdown notebook for calculating time-weighted
+relative quoted spreads from WRDS Daily TAQ `complete_nbbo` tables. It is
+designed for an FOMC event study using event days and matched comparison days.
 
-## Files
+The main file is **`wrds_spread_pipeline.Rmd`**. It includes the methodology,
+explanations, reusable R functions, an offline self-test, an XLK live test, and
+the full batch workflow.
 
-- `run_wrds_spreads.R`: test and batch program.
-- `input_example.csv`: required input layout and the first XLK test case.
-- `run_output/spreads.csv`: one row per input row and window.
-- `run_output/diagnostics.csv`: coverage, invalid-price, locked/crossed-duration, and error diagnostics.
+## What the notebook calculates
 
-## Method
+For each ETF-date-anchor row, the notebook calculates:
 
-For each quote state, the relative quoted spread in basis points is:
+- 50 one-minute spreads from 30 minutes before to 20 minutes after the anchor;
+- six research windows: `[-30,-10)`, `[-10,0)`, `[0,5)`, `[5,10)`,
+  `[10,15)`, and `[15,20)` minutes;
+- a main version that keeps locked quotes (`bid = ask`); and
+- a robustness version that excludes locked quotes.
 
-`10,000 * (ask - bid) / ((ask + bid) / 2)`
+The relative quoted spread is measured in basis points:
 
-The program weights each state by the number of seconds for which it is active inside each window. It retrieves the final quote at or before the first window boundary so a previously active quote carries into the window. Locked quotes (`bid = ask`) are retained with a zero spread. Crossed quotes (`bid > ask`) are excluded for exactly the time they remain active; the prior quote is not carried forward across that interval. Missing and non-positive prices are also excluded and reported separately.
-
-The six windows are `[-30,-10)`, `[-10,0)`, `[0,5)`, `[5,10)`, `[10,15)`, and `[15,20)` minutes relative to `anchor_time`.
-
-## One-time setup
-
-Use R 4.2 or later. Install the packages once:
-
-```r
-install.packages(c("data.table", "DBI", "RPostgres"))
+```text
+10,000 * (ask - bid) / ((ask + bid) / 2)
 ```
 
-Add WRDS credentials to `~/.Renviron` locally. Do not put credentials in the input CSV, script, shared folder, or Git repository.
+Each quote is weighted by the number of seconds for which it is active. A quote
+already active when a window begins is included. Crossed quotes (`bid > ask`)
+are excluded for their exact active duration without filling the interval with
+the previous quote. Missing, zero, or negative prices are excluded and reported
+in the diagnostics.
+
+## Repository files
+
+- `wrds_spread_pipeline.Rmd`: current documented analysis workflow.
+- `input_example.csv`: one-row XLK test input for January 30, 2019 at 14:00 ET.
+- `run_wrds_spreads.R`: earlier command-line version retained for reference.
+- `run_output/`: locally generated output folder; it is not uploaded to GitHub.
+
+## 1. Download the repository
+
+Use the green **Code** button on GitHub to download a ZIP, or clone it:
+
+```bash
+git clone https://github.com/shuau819/wrds-complete-nbbo-spreads.git
+cd wrds-complete-nbbo-spreads
+```
+
+Open `wrds_spread_pipeline.Rmd` in RStudio.
+
+## 2. Install the required R packages
+
+Run this once in the R console:
+
+```r
+install.packages(c("data.table", "DBI", "RPostgres", "rmarkdown", "knitr", "usethis"))
+```
+
+R 4.2 or later is recommended. The WRDS account must have access to NYSE Daily
+TAQ.
+
+## 3. Store WRDS credentials locally
+
+Never type a username or password into the RMD, a CSV, or a GitHub file. In the
+R console, run:
+
+```r
+usethis::edit_r_environ()
+```
+
+Add these lines using your own credentials:
 
 ```text
 WRDS_USER=your_wrds_username
 WRDS_PASSWORD=your_wrds_password
 ```
 
-Restart R after editing `~/.Renviron`. Your WRDS account must have access to Daily TAQ.
+Save the file and restart RStudio. `.Renviron` is excluded by `.gitignore`.
 
-## Input CSV
+## 4. Prepare the input CSV
 
-Required columns:
+The CSV must have one row per ETF and date and exactly these required columns:
 
 | Column | Meaning |
 | --- | --- |
@@ -46,48 +87,76 @@ Required columns:
 | `date` | Quote date in `YYYY-MM-DD` format |
 | `anchor_time` | Event-time anchor in Eastern Time, `HH:MM:SS` |
 | `day_type` | `event` or `comparison` |
-| `matched_event_date` | Event date that supplies the anchor time |
+| `matched_event_date` | Event date associated with the row |
 
-For comparison days, copy the actual announcement time from the matched event into `anchor_time`.
+Example:
 
-## Run the checks
-
-From the pipeline directory:
-
-```bash
-Rscript run_wrds_spreads.R --self-test
+```csv
+ticker,date,anchor_time,day_type,matched_event_date
+XLK,2019-01-30,14:00:00,event,2019-01-30
+XLK,2019-01-23,14:00:00,comparison,2019-01-30
+XLK,2019-02-06,14:00:00,comparison,2019-01-30
 ```
 
-The self-test verifies the time-weighting boundaries, carry-in quote, locked-quote inclusion, and crossed-quote exclusion without accessing WRDS.
+For a comparison day, use the actual FOMC announcement time from its matched
+event day. For example, if the event announcement was at 14:00, the comparison
+day also uses `14:00:00`.
 
-## First live test
+## 5. Run the notebook in RStudio
 
-```bash
-Rscript run_wrds_spreads.R \
-  --input input_example.csv \
-  --output-dir run_output/test_xlk_20190130 \
-  --test-xlk
+Run the chunks from top to bottom. The safest workflow is:
+
+1. Run Sections 1-13. When `file.choose()` appears, select the input CSV.
+2. Confirm that the offline self-test in Section 13 ends with
+   `Offline self-test passed.` This test does not access WRDS.
+3. For the first live check, click the green arrow on the code chunk in
+   Section 14. It queries only XLK on January 30, 2019 at 14:00.
+4. After the live test works, click the green arrow on the batch chunk in
+   Section 15 and select the complete input CSV.
+5. Click the green arrow on the output chunk in Section 16 to write the CSVs.
+
+The live-test, batch, and output chunks have `eval=FALSE`. This is intentional:
+pressing **Knit** will show the report without automatically launching a large
+WRDS query. Run these three chunks manually when data should be downloaded.
+
+Before running Section 16, change this line if a different output folder is
+preferred:
+
+```r
+output_dir <- "run_output/full_batch"
 ```
 
-This queries `taqm_2019.complete_nbbo_20190130` for XLK around 14:00 ET and creates `spreads.csv` and `diagnostics.csv` in `run_output/test_xlk_20190130/`.
+## 6. Output files
 
-## Full batch
+The selected output folder will contain:
 
-Replace `input_example.csv` with the full input file and omit `--test-xlk`:
+- `minute_spreads.csv`: one row per ETF × date × minute × locked treatment;
+- `spreads.csv`: one row per ETF × date × research window × locked treatment;
+- `diagnostics.csv`: minute- and window-level coverage, invalid-price,
+  locked/crossed-duration, and processing-error information.
 
-```bash
-Rscript run_wrds_spreads.R \
-  --input full_input.csv \
-  --output-dir run_output/full_batch
-```
+`locked_treatment = keep_locked` is the main specification.
+`locked_treatment = exclude_locked` is the robustness specification.
 
-Each input row is handled independently. A failed date is retained in both output files with a blank spread and a message in `processing_error`; later rows continue processing.
+In `spreads.csv`, `regression_spread_bps` is populated only when every required
+minute has complete two-sided quote coverage. `mean_of_minute_spreads_bps` is
+retained for diagnostic review even when strict coverage fails.
 
-## Output interpretation
+## 7. Basic checks before regression
 
-`spreads.csv` contains the requested research measure. `diagnostics.csv` reports the duration used or excluded in every window. `valid_coverage_pct` is the share of window seconds with a valid or locked two-sided quote. A result with limited coverage should be reviewed before regression analysis.
+Check `diagnostics.csv` for:
 
-## Sources
+- non-empty `processing_error` values;
+- `complete_quote_coverage = FALSE`;
+- positive `missing_quote_seconds`, `invalid_price_seconds`, or
+  `crossed_seconds`; and
+- unusually large `locked_seconds`.
 
-- WRDS Millisecond Intraday Indicators: <https://wrds-www.wharton.upenn.edu/pages/get-data/nyse-trade-and-quote/millisecond-trade-and-quote-daily-product-2003-present-updated-daily/taq-millisecond-tools/millisecond-intraday-indicators-by-wrds/>
-- NYSE Daily TAQ Client Specification: <https://wrds-www.wharton.upenn.edu/documents/1967/Daily_TAQ_Client_Spec_v4.0.pdf>
+A small crossed interval can make strict coverage false even when it lasts only
+a fraction of a second. Keep the computed diagnostic value and decide on the
+final regression coverage rule separately rather than deleting observations
+without review.
+
+## Data source
+
+- [WRDS Millisecond Intraday Indicators](https://wrds-www.wharton.upenn.edu/pages/get-data/nyse-trade-and-quote/millisecond-trade-and-quote-daily-product-2003-present-updated-daily/taq-millisecond-tools/millisecond-intraday-indicators-by-wrds/)
