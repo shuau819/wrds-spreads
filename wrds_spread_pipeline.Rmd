@@ -1,6 +1,6 @@
 ---
-title: "WRDS Complete-NBBO Spread"
-date: "10/16/2026"
+title: "WRDS Complete-NBBO Liquidity Pipeline"
+date: "10/31/2026"
 output:
   html_document:
     toc: true
@@ -21,9 +21,12 @@ The relative quoted spread is measured in basis points:
 10{,}000 \times \frac{Ask-Bid}{(Ask+Bid)/2}.
 \]
 
-Locked quotes (`bid = ask`) are retained and contribute a zero spread. Crossed
-quotes (`bid > ask`) are excluded only for the time for which they are active.
-The previous quote is not carried forward across a crossed interval.
+Locked quotes (`bid = ask`) are retained and contribute a zero spread in the
+main specification and are excluded in the alternative specification. Crossed,
+invalid, and ambiguous-price quotes are excluded only for the time for which
+they are active. The previous quote is never carried forward across an excluded
+interval. The notebook also calculates one-cent spread percentages and displayed
+bid and ask depth.
 
 # 1. Package setup
 
@@ -34,20 +37,27 @@ install.packages(c("data.table", "DBI", "RPostgres"))
 
 Load `data.table`
 ```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(error = FALSE)
 library(data.table)
 ```
 
 # 2. Define the event-time windows
 
-The analysis uses six non-overlapping windows relative to `anchor_time`. The
+The analysis uses seven non-overlapping windows relative to `anchor_time`. The
 left endpoint is included and the right endpoint is excluded.
 
 ```{r define-windows}
 WINDOWS <- data.table(
-  window = c("m30_m10", "m10_0", "0_5", "5_10", "10_15", "15_20"),
-  start_min = c(-30, -10, 0, 5, 10, 15),
-  end_min = c(-10, 0, 5, 10, 15, 20)
+  window = c(
+    "m30_m10", "m10_0", "0_1", "1_5", "5_10", "10_15", "15_20"
+  ),
+  start_min = c(-30, -10, 0, 1, 5, 10, 15),
+  end_min = c(-10, 0, 1, 5, 10, 15, 20)
 )
+
+COVERAGE_THRESHOLD_PCT <- 99
+STRICT_COVERAGE_THRESHOLD_PCT <- 99.9
+ONE_CENT_TOLERANCE_DOLLARS <- 1e-7
 
 WINDOWS
 ```
@@ -128,7 +138,7 @@ validate_input <- function(x) {
 The example below loads the provided XLK test row. Replace the path with the
 full research input file when it is ready.
 
-```{r read-input}
+```{r read-input, eval=FALSE}
 input_file <- file.choose()
 input <- validate_input(fread(input_file, colClasses = "character"))
 input
@@ -187,10 +197,17 @@ disabled during knitting so that the report can be rendered offline.
 con <- connect_wrds()
 ```
 
-# 7. Pull complete-NBBO quotes
+# 7. Pull complete-NBBO quotes and displayed depth
 
 For a given ticker and date, this function queries the corresponding daily
 table, such as `taqm_2019.complete_nbbo_20190130`.
+
+`time_m` stores the microsecond timestamp and `time_m_nano` stores the remaining
+three nanosecond digits. They are retained separately for equality checks and
+combined when durations are calculated. The depth fields
+`best_bidsizeshares` and `best_asksizeshares` are measured in shares. They are
+the displayed sizes of the quote credited with setting each side of the NBBO,
+not aggregate depth across all exchanges at the best price.
 
 The query retrieves both:
 
@@ -210,43 +227,67 @@ fetch_complete_nbbo <- function(con, ticker, date, start_sec, end_sec) {
 
   sql <- sprintf(
     paste(
-      "WITH prior AS (",
-      "  SELECT date, time_m,",
-      "         EXTRACT(EPOCH FROM time_m)::double precision AS time_sec,",
-      "         sym_root,",
-      "         best_bid::double precision AS best_bid,",
-      "         best_ask::double precision AS best_ask",
+      "WITH prior_key AS (",
+      "  SELECT time_m, COALESCE(time_m_nano, 0) AS time_m_nano",
       "  FROM %s.%s",
       "  WHERE sym_root = %s",
       "    AND COALESCE(sym_suffix, '') = ''",
-      "    AND time_m <= TIME %s",
-      "  ORDER BY time_m DESC",
+      "    AND (time_m < TIME %s OR",
+      "         (time_m = TIME %s AND COALESCE(time_m_nano, 0) = 0))",
+      "  ORDER BY time_m DESC, COALESCE(time_m_nano, 0) DESC",
       "  LIMIT 1",
+      "), prior AS (",
+      "  SELECT q.date, q.time_m, COALESCE(q.time_m_nano, 0) AS time_m_nano,",
+      "         EXTRACT(EPOCH FROM q.time_m)::double precision +",
+      "           COALESCE(q.time_m_nano, 0)::double precision / 1000000000",
+      "           AS time_sec,",
+      "         q.sym_root, q.qu_cond, q.natbbo_ind, q.qu_source,",
+      "         q.nbbo_qu_cond,",
+      "         q.best_bid::double precision AS best_bid,",
+      "         q.best_bidsizeshares::double precision AS best_bidsizeshares,",
+      "         q.best_ask::double precision AS best_ask,",
+      "         q.best_asksizeshares::double precision AS best_asksizeshares",
+      "  FROM %s.%s q",
+      "  INNER JOIN prior_key p",
+      "    ON q.time_m = p.time_m",
+      "   AND COALESCE(q.time_m_nano, 0) = p.time_m_nano",
+      "  WHERE q.sym_root = %s",
+      "    AND COALESCE(q.sym_suffix, '') = ''",
       "), inside_window AS (",
-      "  SELECT date, time_m,",
-      "         EXTRACT(EPOCH FROM time_m)::double precision AS time_sec,",
-      "         sym_root,",
+      "  SELECT date, time_m, COALESCE(time_m_nano, 0) AS time_m_nano,",
+      "         EXTRACT(EPOCH FROM time_m)::double precision +",
+      "           COALESCE(time_m_nano, 0)::double precision / 1000000000",
+      "           AS time_sec,",
+      "         sym_root, qu_cond, natbbo_ind, qu_source, nbbo_qu_cond,",
       "         best_bid::double precision AS best_bid,",
-      "         best_ask::double precision AS best_ask",
+      "         best_bidsizeshares::double precision AS best_bidsizeshares,",
+      "         best_ask::double precision AS best_ask,",
+      "         best_asksizeshares::double precision AS best_asksizeshares",
       "  FROM %s.%s",
       "  WHERE sym_root = %s",
       "    AND COALESCE(sym_suffix, '') = ''",
-      "    AND time_m > TIME %s",
+      "    AND (time_m > TIME %s OR",
+      "         (time_m = TIME %s AND COALESCE(time_m_nano, 0) > 0))",
       "    AND time_m < TIME %s",
       ")",
       "SELECT * FROM prior",
       "UNION ALL",
       "SELECT * FROM inside_window",
-      "ORDER BY time_sec",
+      "ORDER BY time_m, time_m_nano",
       sep = "\n"
     ),
     schema,
     table,
     DBI::dbQuoteString(con, ticker),
     DBI::dbQuoteString(con, start_clock),
+    DBI::dbQuoteString(con, start_clock),
     schema,
     table,
     DBI::dbQuoteString(con, ticker),
+    schema,
+    table,
+    DBI::dbQuoteString(con, ticker),
+    DBI::dbQuoteString(con, start_clock),
     DBI::dbQuoteString(con, start_clock),
     DBI::dbQuoteString(con, end_clock)
   )
@@ -260,6 +301,16 @@ fetch_complete_nbbo <- function(con, ticker, date, start_sec, end_sec) {
 Each two-sided quote is assigned to one diagnostic category. Valid and locked
 quotes are used in the spread calculation. Crossed, missing, and non-positive
 quotes are excluded and their durations are reported.
+
+The inspected WRDS `complete_nbbo` table retains `qu_cond`, `natbbo_ind`,
+`qu_source`, and `nbbo_qu_cond`, but it has no separate cancellation/correction
+field and no sequence field. NYSE documentation says quote condition determines
+whether a source quote qualifies for BBO calculation, while the NBBO file
+records quotes that cause the NBBO to change. Accordingly, this notebook uses
+the constructed best bid and ask supplied by `complete_nbbo` and does not apply
+an additional quote-condition filter. A cancellation or correction that changes
+the NBBO is represented by a subsequent state update; the notebook does not
+attempt to reconstruct an unavailable cancellation flag.
 
 ```{r classify-function}
 classify_state <- function(bid, ask) {
@@ -288,8 +339,15 @@ classify_state <- function(bid, ask) {
 
 Each quote is active from its timestamp until the next quote update. The final
 quote already active at 30 minutes before the anchor is carried into the first
-minute. If several records share a timestamp, the last returned state becomes
-active. Crossed quotes are never replaced with the previous valid quote.
+minute. Distinct nanosecond updates are retained even when they share the same
+`time_m` value.
+
+Rows are collapsed only when both `time_m` and `time_m_nano` agree. If their bid
+and ask prices conflict, that timestamp becomes an `ambiguous_price` state and
+its active duration is excluded. If prices agree but a side's sizes conflict,
+the spread remains usable while depth on only that side is marked ambiguous and
+excluded. Crossed or otherwise excluded quotes are never replaced with an older
+valid quote.
 
 ```{r prepare-states-function}
 prepare_quote_states <- function(quotes, anchor_sec) {
@@ -298,10 +356,51 @@ prepare_quote_states <- function(quotes, anchor_sec) {
 
   quotes <- copy(as.data.table(quotes))
   quotes <- quotes[is.finite(time_sec) & time_sec < global_end]
-  setorder(quotes, time_sec)
+  if (!"time_m_nano" %in% names(quotes)) quotes[, time_m_nano := 0L]
+  if (!"best_bidsizeshares" %in% names(quotes)) {
+    quotes[, best_bidsizeshares := NA_real_]
+  }
+  if (!"best_asksizeshares" %in% names(quotes)) {
+    quotes[, best_asksizeshares := NA_real_]
+  }
+
+  if (all(c("time_m", "time_m_nano") %in% names(quotes))) {
+    quotes[, timestamp_key := paste(as.character(time_m), time_m_nano, sep = "|")]
+    setorder(quotes, time_m, time_m_nano)
+  } else {
+    quotes[, timestamp_key := sprintf("%.9f", time_sec)]
+    setorder(quotes, time_sec)
+  }
+
+  collapse_timestamp <- function(x) {
+    price_pairs <- unique(x[, .(best_bid, best_ask)])
+    ambiguous_price <- nrow(price_pairs) != 1L
+    bid_size_agrees <- uniqueN(x$best_bidsizeshares, na.rm = FALSE) == 1L
+    ask_size_agrees <- uniqueN(x$best_asksizeshares, na.rm = FALSE) == 1L
+
+    data.table(
+      time_sec = x$time_sec[1L],
+      best_bid = if (ambiguous_price) NA_real_ else x$best_bid[1L],
+      best_ask = if (ambiguous_price) NA_real_ else x$best_ask[1L],
+      best_bidsizeshares = if (!ambiguous_price && bid_size_agrees) {
+        x$best_bidsizeshares[1L]
+      } else {
+        NA_real_
+      },
+      best_asksizeshares = if (!ambiguous_price && ask_size_agrees) {
+        x$best_asksizeshares[1L]
+      } else {
+        NA_real_
+      },
+      ambiguous_price = ambiguous_price,
+      bid_depth_ambiguous = ambiguous_price || !bid_size_agrees,
+      ask_depth_ambiguous = ambiguous_price || !ask_size_agrees
+    )
+  }
 
   if (nrow(quotes)) {
-    quotes <- quotes[, .SD[.N], by = time_sec]
+    quotes <- quotes[, collapse_timestamp(.SD), by = timestamp_key]
+    setorder(quotes, time_sec)
   }
 
   if (!nrow(quotes)) {
@@ -309,7 +408,13 @@ prepare_quote_states <- function(quotes, anchor_sec) {
       state_start = global_start,
       state_end = global_end,
       state = "missing_quote",
-      spread_bps = NA_real_
+      spread_bps = NA_real_,
+      dollar_spread = NA_real_,
+      bid_depth_shares = NA_real_,
+      ask_depth_shares = NA_real_,
+      bid_depth_ambiguous = FALSE,
+      ask_depth_ambiguous = FALSE,
+      large_spread = FALSE
     ))
   }
 
@@ -317,14 +422,40 @@ prepare_quote_states <- function(quotes, anchor_sec) {
   quotes[, state_end := shift(time_sec, type = "lead", fill = global_end)]
   quotes[, state_end := pmin(state_end, global_end)]
   quotes <- quotes[state_end > state_start]
-  quotes[, state := classify_state(best_bid, best_ask)]
+  quotes[, state := fifelse(
+    ambiguous_price,
+    "ambiguous_price",
+    classify_state(best_bid, best_ask)
+  )]
+  quotes[, dollar_spread := fifelse(
+    state %chin% c("valid", "locked"),
+    best_ask - best_bid,
+    NA_real_
+  )]
   quotes[, spread_bps := fifelse(
     state %chin% c("valid", "locked"),
     10000 * (best_ask - best_bid) / ((best_ask + best_bid) / 2),
     NA_real_
   )]
+  quotes[, large_spread := !is.na(spread_bps) & spread_bps > 100]
+  quotes[, bid_depth_shares := fifelse(
+    !bid_depth_ambiguous & is.finite(best_bidsizeshares) &
+      best_bidsizeshares > 0,
+    best_bidsizeshares,
+    NA_real_
+  )]
+  quotes[, ask_depth_shares := fifelse(
+    !ask_depth_ambiguous & is.finite(best_asksizeshares) &
+      best_asksizeshares > 0,
+    best_asksizeshares,
+    NA_real_
+  )]
 
-  states <- quotes[, .(state_start, state_end, state, spread_bps)]
+  states <- quotes[, .(
+    state_start, state_end, state, spread_bps, dollar_spread,
+    bid_depth_shares, ask_depth_shares,
+    bid_depth_ambiguous, ask_depth_ambiguous, large_spread
+  )]
 
   if (!nrow(states) || states$state_start[1L] > global_start) {
     first_start <- if (nrow(states)) states$state_start[1L] else global_end
@@ -333,7 +464,13 @@ prepare_quote_states <- function(quotes, anchor_sec) {
         state_start = global_start,
         state_end = first_start,
         state = "missing_quote",
-        spread_bps = NA_real_
+        spread_bps = NA_real_,
+        dollar_spread = NA_real_,
+        bid_depth_shares = NA_real_,
+        ask_depth_shares = NA_real_,
+        bid_depth_ambiguous = FALSE,
+        ask_depth_ambiguous = FALSE,
+        large_spread = FALSE
       ),
       states
     )
@@ -351,9 +488,11 @@ The graph dataset contains one time-weighted observation for every minute from
 - `keep_locked`: locked quotes are valid and contribute a zero spread;
 - `exclude_locked`: locked duration is removed from the robustness calculation.
 
-`complete_quote_coverage` checks whether the full minute has a valid or locked
-two-sided quote. `complete_calculation_coverage` additionally requires every
-second to be eligible for the selected locked-quote treatment.
+`coverage_pct` is the percentage of the minute with a spread eligible under the
+selected treatment. One-cent diagnostics use the same spread-usable seconds.
+Bid and ask depth have separate usable seconds and coverage because one side's
+size may be missing, nonpositive, or ambiguous while the other side remains
+usable.
 
 ```{r calculate-minute-spreads-function}
 calculate_one_minute_spreads <- function(
@@ -374,6 +513,12 @@ calculate_one_minute_spreads <- function(
       .(
         state,
         spread_bps,
+        dollar_spread,
+        bid_depth_shares,
+        ask_depth_shares,
+        bid_depth_ambiguous,
+        ask_depth_ambiguous,
+        large_spread,
         seconds = pmax(
           0,
           pmin(state_end, minute_end) - pmax(state_start, minute_start)
@@ -386,19 +531,81 @@ calculate_one_minute_spreads <- function(
     locked_seconds <- duration_for("locked")
     eligible_seconds <- sum(overlap[state %chin% eligible_states, seconds])
 
-    numerator <- sum(
+    spread_numerator <- sum(
       overlap[state %chin% eligible_states, spread_bps * seconds],
       na.rm = TRUE
     )
 
+    one_cent_seconds <- sum(overlap[
+      state %chin% eligible_states &
+        !is.na(dollar_spread) &
+        abs(dollar_spread - 0.01) <= ONE_CENT_TOLERANCE_DOLLARS,
+      seconds
+    ])
+    large_spread_seconds <- sum(overlap[
+      state %chin% eligible_states & large_spread,
+      seconds
+    ])
+
+    bid_depth_usable <- overlap[
+      state %chin% eligible_states & !is.na(bid_depth_shares)
+    ]
+    ask_depth_usable <- overlap[
+      state %chin% eligible_states & !is.na(ask_depth_shares)
+    ]
+    bid_depth_usable_seconds <- sum(bid_depth_usable$seconds)
+    ask_depth_usable_seconds <- sum(ask_depth_usable$seconds)
+    bid_depth_numerator <- sum(
+      bid_depth_usable$bid_depth_shares * bid_depth_usable$seconds,
+      na.rm = TRUE
+    )
+    ask_depth_numerator <- sum(
+      ask_depth_usable$ask_depth_shares * ask_depth_usable$seconds,
+      na.rm = TRUE
+    )
+
+    bid_depth_ambiguous_seconds <- sum(
+      overlap[bid_depth_ambiguous == TRUE, seconds]
+    )
+    ask_depth_ambiguous_seconds <- sum(
+      overlap[ask_depth_ambiguous == TRUE, seconds]
+    )
+    bid_depth_invalid_size_seconds <- sum(overlap[
+      state %chin% eligible_states &
+        !bid_depth_ambiguous & is.na(bid_depth_shares),
+      seconds
+    ])
+    ask_depth_invalid_size_seconds <- sum(overlap[
+      state %chin% eligible_states &
+        !ask_depth_ambiguous & is.na(ask_depth_shares),
+      seconds
+    ])
+
     quote_coverage_seconds <- valid_seconds + locked_seconds
+    coverage_pct <- 100 * eligible_seconds / 60
 
     data.table(
       locked_treatment = locked_treatment,
       minute_start_min = minute_start_min,
       minute_end_min = minute_start_min + 1L,
       tw_relative_quoted_spread_bps = if (eligible_seconds > 0) {
-        numerator / eligible_seconds
+        spread_numerator / eligible_seconds
+      } else {
+        NA_real_
+      },
+      one_cent_seconds = one_cent_seconds,
+      one_cent_pct = if (eligible_seconds > 0) {
+        100 * one_cent_seconds / eligible_seconds
+      } else {
+        NA_real_
+      },
+      tw_bid_depth_shares = if (bid_depth_usable_seconds > 0) {
+        bid_depth_numerator / bid_depth_usable_seconds
+      } else {
+        NA_real_
+      },
+      tw_ask_depth_shares = if (ask_depth_usable_seconds > 0) {
+        ask_depth_numerator / ask_depth_usable_seconds
       } else {
         NA_real_
       },
@@ -408,29 +615,47 @@ calculate_one_minute_spreads <- function(
       missing_quote_seconds = duration_for("missing_quote"),
       missing_price_seconds = duration_for("missing_price"),
       invalid_price_seconds = duration_for("invalid_price"),
+      ambiguous_price_seconds = duration_for("ambiguous_price"),
+      large_spread_seconds = large_spread_seconds,
       eligible_seconds = eligible_seconds,
       excluded_seconds = 60 - eligible_seconds,
+      coverage_pct = coverage_pct,
+      passes_coverage = eligible_seconds > 0 &
+        coverage_pct + 1e-10 >= COVERAGE_THRESHOLD_PCT,
+      passes_strict_coverage = eligible_seconds > 0 &
+        coverage_pct + 1e-10 >= STRICT_COVERAGE_THRESHOLD_PCT,
       quote_coverage_pct = 100 * quote_coverage_seconds / 60,
-      calculation_coverage_pct = 100 * eligible_seconds / 60,
+      calculation_coverage_pct = coverage_pct,
       complete_quote_coverage = abs(quote_coverage_seconds - 60) < 1e-7,
-      complete_calculation_coverage = abs(eligible_seconds - 60) < 1e-7
+      complete_calculation_coverage = abs(eligible_seconds - 60) < 1e-7,
+      bid_depth_usable_seconds = bid_depth_usable_seconds,
+      ask_depth_usable_seconds = ask_depth_usable_seconds,
+      bid_depth_coverage_pct = 100 * bid_depth_usable_seconds / 60,
+      ask_depth_coverage_pct = 100 * ask_depth_usable_seconds / 60,
+      bid_depth_ambiguous_seconds = bid_depth_ambiguous_seconds,
+      ask_depth_ambiguous_seconds = ask_depth_ambiguous_seconds,
+      bid_depth_invalid_size_seconds = bid_depth_invalid_size_seconds,
+      ask_depth_invalid_size_seconds = ask_depth_invalid_size_seconds
     )
   }))
 }
 ```
 
-# 11. Construct regression windows from minute averages
+# 11. Construct research windows
 
-The four post-announcement regression measures are simple averages of five
-one-minute spreads. The baseline is the average of the 20 one-minute spreads
-from `-30` to `-10`. The `-10` to `0` window is retained as an anticipation
-diagnostic.
+The minute spreads remain the descriptive graph series. Research-window spreads
+are recomputed using usable seconds rather than taking an unweighted mean of
+minute averages:
 
-The unfiltered mean is preserved for review. `regression_spread_bps` is set to
-missing unless every underlying minute has complete two-sided quote coverage
-and a calculable spread under the selected locked-quote treatment. A short
-locked interval therefore does not make the robustness window incomplete, but
-a minute containing only locked quotes has no excluding-locked spread.
+\[
+Window\ Spread =
+\frac{\sum_m Minute\ Spread_m \times Usable\ Seconds_m}
+     {\sum_m Usable\ Seconds_m}.
+\]
+
+Minutes with zero usable seconds contribute to neither the numerator nor the
+denominator. `regression_spread_bps` uses this window measure when coverage is
+at least 99%. The 99.9% flag is retained for a stricter sensitivity check.
 
 ```{r aggregate-minute-windows-function}
 aggregate_minute_windows <- function(minute_results) {
@@ -442,14 +667,55 @@ aggregate_minute_windows <- function(minute_results) {
 
     expected_minutes <- w$end_min - w$start_min
     complete_window <- nrow(x) == expected_minutes &&
-      all(x$complete_quote_coverage) &&
-      all(!is.na(x$tw_relative_quoted_spread_bps))
+      all(x$complete_calculation_coverage)
 
     raw_mean <- if (any(!is.na(x$tw_relative_quoted_spread_bps))) {
       mean(x$tw_relative_quoted_spread_bps, na.rm = TRUE)
     } else {
       NA_real_
     }
+
+    window_seconds <- expected_minutes * 60
+    usable_seconds <- sum(x$eligible_seconds)
+    spread_numerator <- sum(
+      x$tw_relative_quoted_spread_bps * x$eligible_seconds,
+      na.rm = TRUE
+    )
+    window_spread <- if (usable_seconds > 0) {
+      spread_numerator / usable_seconds
+    } else {
+      NA_real_
+    }
+    coverage_pct <- 100 * usable_seconds / window_seconds
+    passes_coverage <- usable_seconds > 0 &&
+      coverage_pct + 1e-10 >= COVERAGE_THRESHOLD_PCT
+    passes_strict_coverage <- usable_seconds > 0 &&
+      coverage_pct + 1e-10 >= STRICT_COVERAGE_THRESHOLD_PCT
+
+    bid_depth_usable_seconds <- sum(x$bid_depth_usable_seconds)
+    ask_depth_usable_seconds <- sum(x$ask_depth_usable_seconds)
+    window_bid_depth <- if (bid_depth_usable_seconds > 0) {
+      sum(
+        x$tw_bid_depth_shares * x$bid_depth_usable_seconds,
+        na.rm = TRUE
+      ) / bid_depth_usable_seconds
+    } else {
+      NA_real_
+    }
+    window_ask_depth <- if (ask_depth_usable_seconds > 0) {
+      sum(
+        x$tw_ask_depth_shares * x$ask_depth_usable_seconds,
+        na.rm = TRUE
+      ) / ask_depth_usable_seconds
+    } else {
+      NA_real_
+    }
+    bid_depth_coverage_pct <- 100 * bid_depth_usable_seconds / window_seconds
+    ask_depth_coverage_pct <- 100 * ask_depth_usable_seconds / window_seconds
+    bid_depth_passes_coverage <- bid_depth_usable_seconds > 0 &&
+      bid_depth_coverage_pct + 1e-10 >= COVERAGE_THRESHOLD_PCT
+    ask_depth_passes_coverage <- ask_depth_usable_seconds > 0 &&
+      ask_depth_coverage_pct + 1e-10 >= COVERAGE_THRESHOLD_PCT
 
     data.table(
       locked_treatment = unique(x$locked_treatment),
@@ -462,15 +728,55 @@ aggregate_minute_windows <- function(minute_results) {
       complete_calculation_minutes = sum(x$complete_calculation_coverage),
       all_minutes_complete = complete_window,
       mean_of_minute_spreads_bps = raw_mean,
-      regression_spread_bps = if (complete_window) raw_mean else NA_real_,
+      window_spread_bps = window_spread,
+      regression_spread_bps = if (passes_coverage) window_spread else NA_real_,
+      window_seconds = window_seconds,
+      coverage_pct = coverage_pct,
+      passes_coverage = passes_coverage,
+      passes_strict_coverage = passes_strict_coverage,
+      one_cent_seconds = sum(x$one_cent_seconds),
+      one_cent_pct = if (usable_seconds > 0) {
+        100 * sum(x$one_cent_seconds) / usable_seconds
+      } else {
+        NA_real_
+      },
+      window_tw_bid_depth_shares = window_bid_depth,
+      window_tw_ask_depth_shares = window_ask_depth,
+      regression_bid_depth_shares = if (bid_depth_passes_coverage) {
+        window_bid_depth
+      } else {
+        NA_real_
+      },
+      regression_ask_depth_shares = if (ask_depth_passes_coverage) {
+        window_ask_depth
+      } else {
+        NA_real_
+      },
       valid_seconds = sum(x$valid_seconds),
       locked_seconds = sum(x$locked_seconds),
       crossed_seconds = sum(x$crossed_seconds),
       missing_quote_seconds = sum(x$missing_quote_seconds),
       missing_price_seconds = sum(x$missing_price_seconds),
       invalid_price_seconds = sum(x$invalid_price_seconds),
-      eligible_seconds = sum(x$eligible_seconds),
-      excluded_seconds = sum(x$excluded_seconds)
+      ambiguous_price_seconds = sum(x$ambiguous_price_seconds),
+      large_spread_seconds = sum(x$large_spread_seconds),
+      has_large_spread = sum(x$large_spread_seconds) > 0,
+      eligible_seconds = usable_seconds,
+      excluded_seconds = window_seconds - usable_seconds,
+      bid_depth_usable_seconds = bid_depth_usable_seconds,
+      ask_depth_usable_seconds = ask_depth_usable_seconds,
+      bid_depth_coverage_pct = bid_depth_coverage_pct,
+      ask_depth_coverage_pct = ask_depth_coverage_pct,
+      bid_depth_passes_coverage = bid_depth_passes_coverage,
+      ask_depth_passes_coverage = ask_depth_passes_coverage,
+      bid_depth_passes_strict_coverage = bid_depth_usable_seconds > 0 &&
+        bid_depth_coverage_pct + 1e-10 >= STRICT_COVERAGE_THRESHOLD_PCT,
+      ask_depth_passes_strict_coverage = ask_depth_usable_seconds > 0 &&
+        ask_depth_coverage_pct + 1e-10 >= STRICT_COVERAGE_THRESHOLD_PCT,
+      bid_depth_ambiguous_seconds = sum(x$bid_depth_ambiguous_seconds),
+      ask_depth_ambiguous_seconds = sum(x$ask_depth_ambiguous_seconds),
+      bid_depth_invalid_size_seconds = sum(x$bid_depth_invalid_size_seconds),
+      ask_depth_invalid_size_seconds = sum(x$ask_depth_invalid_size_seconds)
     )
   }))
 }
@@ -479,7 +785,7 @@ aggregate_minute_windows <- function(minute_results) {
 # 12. Process one ETF-date observation
 
 This wrapper downloads one ETF-date and returns both the 50-minute graph data
-and the six summary windows for the main and robustness treatments.
+and the seven summary windows for the main and robustness treatments.
 
 ```{r process-one-function}
 process_one <- function(con, row) {
@@ -526,6 +832,12 @@ process_one <- function(con, row) {
     minute_error[, `:=`(
       minute_end_min = minute_start_min + 1L,
       tw_relative_quoted_spread_bps = NA_real_,
+      one_cent_pct = NA_real_,
+      tw_bid_depth_shares = NA_real_,
+      tw_ask_depth_shares = NA_real_,
+      coverage_pct = 0,
+      passes_coverage = FALSE,
+      passes_strict_coverage = FALSE,
       processing_error = message
     )]
 
@@ -541,7 +853,16 @@ process_one <- function(con, row) {
     )
     window_error[, `:=`(
       mean_of_minute_spreads_bps = NA_real_,
+      window_spread_bps = NA_real_,
       regression_spread_bps = NA_real_,
+      coverage_pct = 0,
+      passes_coverage = FALSE,
+      passes_strict_coverage = FALSE,
+      one_cent_pct = NA_real_,
+      window_tw_bid_depth_shares = NA_real_,
+      window_tw_ask_depth_shares = NA_real_,
+      regression_bid_depth_shares = NA_real_,
+      regression_ask_depth_shares = NA_real_,
       all_minutes_complete = FALSE,
       processing_error = message
     )]
@@ -554,11 +875,11 @@ process_one <- function(con, row) {
 }
 ```
 
-# 13. Run an offline logic test
+# 13. Run offline logic tests
 
-The test verifies the carry-in quote, 50-minute output, crossed-quote exclusion,
-locked-quote inclusion in the main version, and locked-quote exclusion in the
-robustness version.
+The tests verify carry-in, nanosecond ordering, duplicate-timestamp ambiguity,
+locked/crossed treatment, one-cent and depth calculations, usable-second window
+weighting, and the 99% coverage rule without accessing WRDS.
 
 ```{r self-test}
 anchor_test <- 14 * 3600
@@ -571,7 +892,9 @@ synthetic_quotes <- data.table(
     14 * 3600 + 5 * 60
   ),
   best_bid = c(99, 100, 102, 101, 102),
-  best_ask = c(101, 102, 101, 101, 103)
+  best_ask = c(101, 102, 101, 101, 103),
+  best_bidsizeshares = c(1000, 1100, 1200, 1300, 1400),
+  best_asksizeshares = c(900, 1000, 1100, 1200, 1300)
 )
 
 test_states <- prepare_quote_states(synthetic_quotes, anchor_test)
@@ -593,16 +916,80 @@ stopifnot(
   is.na(test_exclude[
     minute_start_min == 0, tw_relative_quoted_spread_bps
   ]),
-  test_windows[window == "0_5", regression_spread_bps] == 0
+  test_windows[window == "0_1", regression_spread_bps] == 0,
+  test_windows[window == "1_5", regression_spread_bps] == 0
 )
 
-test_windows
+# A half-second crossed interval fails complete coverage but still passes 99%.
+coverage_spread <- 10000 * 0.01 / 100.005
+coverage_states <- data.table(
+  state_start = c(anchor_test, anchor_test + 59.5),
+  state_end = c(anchor_test + 59.5, anchor_test + 60),
+  state = c("valid", "crossed"),
+  spread_bps = c(coverage_spread, NA_real_),
+  dollar_spread = c(0.01, NA_real_),
+  bid_depth_shares = c(1000, NA_real_),
+  ask_depth_shares = c(2000, NA_real_),
+  bid_depth_ambiguous = FALSE,
+  ask_depth_ambiguous = FALSE,
+  large_spread = FALSE
+)
+coverage_minutes <- calculate_one_minute_spreads(
+  coverage_states, anchor_test, include_locked = TRUE
+)
+coverage_windows <- aggregate_minute_windows(coverage_minutes)
+
+stopifnot(
+  !coverage_minutes[minute_start_min == 0, complete_calculation_coverage],
+  abs(coverage_minutes[minute_start_min == 0, coverage_pct] -
+        100 * 59.5 / 60) < 1e-10,
+  coverage_windows[window == "0_1", passes_coverage],
+  !coverage_windows[window == "0_1", passes_strict_coverage],
+  !is.na(coverage_windows[window == "0_1", regression_spread_bps]),
+  abs(coverage_windows[window == "0_1", one_cent_pct] - 100) < 1e-10,
+  coverage_windows[window == "0_1", window_tw_bid_depth_shares] == 1000,
+  coverage_windows[window == "0_1", window_tw_ask_depth_shares] == 2000
+)
+
+# Same full timestamp: price agreement preserves spread; a conflicting size
+# removes only that side's depth. Price disagreement creates an excluded state.
+duplicate_quotes <- data.table(
+  time_m = c(
+    "13:30:00", "14:00:10", "14:00:10", "14:00:20", "14:00:20"
+  ),
+  time_m_nano = c(0L, 100L, 100L, 200L, 200L),
+  time_sec = c(
+    anchor_test - 1800, anchor_test + 10.0000001,
+    anchor_test + 10.0000001, anchor_test + 20.0000002,
+    anchor_test + 20.0000002
+  ),
+  best_bid = c(100, 100, 100, 100, 100.01),
+  best_ask = c(100.01, 100.01, 100.01, 100.01, 100.02),
+  best_bidsizeshares = c(1000, 1000, 1200, 1000, 1000),
+  best_asksizeshares = c(900, 900, 900, 900, 900)
+)
+duplicate_states <- prepare_quote_states(duplicate_quotes, anchor_test)
+
+stopifnot(
+  duplicate_states[state_start > anchor_test + 9 &
+                     state_start < anchor_test + 11,
+                   bid_depth_ambiguous],
+  !duplicate_states[state_start > anchor_test + 9 &
+                      state_start < anchor_test + 11,
+                    ask_depth_ambiguous],
+  duplicate_states[state_start > anchor_test + 19 &
+                     state_start < anchor_test + 21,
+                   state] == "ambiguous_price"
+)
+
+message("Offline self-tests passed.")
+coverage_windows[window == "0_1"]
 ```
 
 # 14. Run the XLK live test
 
 This disabled chunk produces 100 minute rows (50 minutes times two locked-quote
-treatments) and 12 window rows (six windows times two treatments).
+treatments) and 14 window rows (seven windows times two treatments).
 
 ```{r xlk-live-test, eval=FALSE}
 con <- connect_wrds()
@@ -651,9 +1038,11 @@ View(window_results)
 
 # 16. Write output files
 
-`minute_spreads.csv` supplies the 50-minute graph data. `spreads.csv` supplies
-the baseline, anticipation, and four post-announcement windows. The diagnostics
-file combines coverage and error fields at both resolutions.
+`minute_spreads.csv` supplies the 50-minute graph data, one-cent diagnostic, and
+minute depth measures. `spreads.csv` supplies the baseline, anticipation, and
+five post-announcement windows. The diagnostics file combines coverage,
+excluded-duration, ambiguity, large-spread, depth, and error fields at both
+resolutions.
 
 ```{r write-outputs, eval=FALSE}
 output_dir <- "run_output/full_batch"
@@ -662,13 +1051,21 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 minute_spread_columns <- c(
   "input_row", "ticker", "date", "anchor_time", "day_type",
   "matched_event_date", "locked_treatment", "minute_start_min",
-  "minute_end_min", "tw_relative_quoted_spread_bps"
+  "minute_end_min", "tw_relative_quoted_spread_bps", "one_cent_pct",
+  "tw_bid_depth_shares", "tw_ask_depth_shares", "coverage_pct",
+  "bid_depth_coverage_pct", "ask_depth_coverage_pct"
 )
 window_spread_columns <- c(
   "input_row", "ticker", "date", "anchor_time", "day_type",
   "matched_event_date", "locked_treatment", "window",
   "window_start_min", "window_end_min", "mean_of_minute_spreads_bps",
-  "regression_spread_bps", "all_minutes_complete"
+  "window_spread_bps", "regression_spread_bps", "coverage_pct",
+  "passes_coverage", "passes_strict_coverage", "one_cent_pct",
+  "window_tw_bid_depth_shares", "window_tw_ask_depth_shares",
+  "regression_bid_depth_shares", "regression_ask_depth_shares",
+  "bid_depth_coverage_pct", "ask_depth_coverage_pct",
+  "bid_depth_passes_coverage", "ask_depth_passes_coverage",
+  "all_minutes_complete"
 )
 
 fwrite(
@@ -708,16 +1105,46 @@ fwrite(
 
 - `locked_treatment` identifies the main (`keep_locked`) or robustness
   (`exclude_locked`) result.
-- `complete_quote_coverage` requires a valid or locked two-sided quote for the
-  entire minute.
-- `complete_calculation_coverage` shows the percentage of the minute used in
-  the selected calculation. For `exclude_locked`, it may be below 100% even
-  when two-sided quote coverage is complete.
-- `regression_spread_bps` is populated only when every required minute is
-  complete. `mean_of_minute_spreads_bps` is retained for diagnostic review.
-- `crossed_seconds` is excluded without carrying the earlier quote forward.
+- `coverage_pct` is 100 times spread-usable seconds divided by total window
+  seconds. `passes_coverage` uses 99%; `passes_strict_coverage` uses 99.9%.
+- `regression_spread_bps` uses the usable-second-weighted `window_spread_bps`
+  whenever 99% coverage passes, even if `all_minutes_complete` is false.
+- `mean_of_minute_spreads_bps` is retained only as a transparent comparison to
+  the earlier unweighted-minute method.
+- `one_cent_pct` is the percentage of spread-usable seconds with a dollar
+  spread within `1e-7` dollars of one cent.
+- `tw_bid_depth_shares` and `tw_ask_depth_shares` are side-specific minute
+  measures. Window depth is weighted by that side's usable depth seconds.
+- `bid_depth_coverage_pct` and `ask_depth_coverage_pct` are reported separately.
+- `crossed_seconds`, `missing_quote_seconds`, `missing_price_seconds`,
+  `invalid_price_seconds`, and `ambiguous_price_seconds` retain exclusions by
+  reason. No excluded interval is filled with an earlier valid quote.
+- `bid_depth_ambiguous_seconds` and `ask_depth_ambiguous_seconds` identify
+  same-full-timestamp conflicts affecting each side's depth.
+- `large_spread_seconds` and `has_large_spread` flag relative spreads above
+  100 basis points for review; they are not automatically deleted.
 - `processing_error` records a failed ticker-date without stopping the batch.
 
-The 50 one-minute observations are used for descriptive graphs. The four
-post-announcement five-minute observations and the 20-minute baseline are used
-to construct the regression variables.
+The 50 one-minute observations are used for descriptive graphs. The five
+post-announcement windows (`0-1`, `1-5`, `5-10`, `10-15`, and `15-20`) and the
+20-minute baseline are used to construct the regression variables.
+
+# 18. Source-field interpretation
+
+- NYSE describes the Daily TAQ NBBO file as a record of quotes that cause the
+  NBBO to change. Quote conditions determine whether source quotes qualify for
+  BBO calculation.
+- The inspected WRDS `complete_nbbo_20190130` table contains condition fields
+  but no sequence or cancellation/correction field. This pipeline therefore
+  does not apply an unsupported extra condition or cancellation filter.
+- `best_bidsizeshares` and `best_asksizeshares` are displayed shares associated
+  with the quote credited with setting each side of the NBBO. They are not the
+  sum of all exchange depth available at the same best price.
+- Additional quote-condition filters should be added only after their intended
+  economic interpretation and the construction of `complete_nbbo` are verified
+  for every sample year.
+
+Method and field references:
+
+- [Project methodology: Liquidity Measurement and Timing](https://docs.google.com/document/d/10g4mS0OB0uAShr_xz6ZNIYwe6qJSnFu1Qmqj03CSF_Q/edit)
+- [NYSE Daily TAQ Client Specification](https://www.nyse.com/publicdocs/nyse/data/Daily_TAQ_Client_Spec_v4.1b.pdf)
